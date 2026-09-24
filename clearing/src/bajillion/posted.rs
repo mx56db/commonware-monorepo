@@ -54,15 +54,12 @@ pub fn decode_with_strategy<P: PublicKey, D: Digest>(
     strategy: &impl Strategy,
 ) -> Result<Dealing<P>, CodecError> {
     let invalid = |reason| CodecError::Invalid("clearing::Dealing", reason);
-    if P::SIZE != 32 {
-        return Err(invalid("account keys must encode exactly 32 bytes"));
-    }
     let mut reader = encoded.clone();
     let limits = context.limits();
     let max_rows = limits
         .max_rows()
         .min(u64::from(MAX_VECTOR_LENGTH))
-        .min((reader.remaining() / 33) as u64) as usize;
+        .min((reader.remaining() / (P::SIZE + 1)) as u64) as usize;
     let count = usize::read_cfg(&mut reader, &RangeCfg::new(..=max_rows))?;
     // Groups of 64 keys let each worker use the key type's bulk validation. Collection
     // preserves the byte order that binds each recipient index to its full public key.
@@ -159,10 +156,9 @@ pub(crate) fn encode<P: PublicKey>(
     rows: &[Row<P>],
     aggregate: &Option<OperatorAggregate>,
 ) -> Result<Bytes, TransitionError> {
-    if P::SIZE != 32
-        || rows
-            .windows(2)
-            .any(|pair| pair[0].account.as_ref() >= pair[1].account.as_ref())
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].account.as_ref() >= pair[1].account.as_ref())
     {
         return Err(TransitionError::NonCanonicalRows);
     }

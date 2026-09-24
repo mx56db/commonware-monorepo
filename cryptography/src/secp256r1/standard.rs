@@ -2,7 +2,7 @@ cfg_if::cfg_if! {
     if #[cfg(feature = "std")] {
         use std::borrow::Cow;
     } else {
-        use alloc::borrow::Cow;
+        use alloc::{borrow::Cow, vec::Vec};
     }
 }
 use super::common::{
@@ -213,6 +213,55 @@ impl arbitrary::Arbitrary<'_> for Signature {
     }
 }
 
+/// Secp256r1 batch verifier.
+///
+/// ECDSA has no aggregate check, so the batch verifies each queued signature independently and
+/// is deterministic: it never accepts an invalid batch.
+pub struct Batch {
+    items: Vec<(Vec<u8>, PublicKey, Signature)>,
+}
+
+impl crate::BatchVerifier for Batch {
+    type PublicKey = PublicKey;
+
+    fn new(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn add(
+        &mut self,
+        namespace: &[u8],
+        message: &[u8],
+        public_key: &PublicKey,
+        signature: &Signature,
+    ) -> bool {
+        self.items.push((
+            union_unique(namespace, message),
+            public_key.clone(),
+            signature.clone(),
+        ));
+        true
+    }
+
+    fn verify<R: rand_core::CryptoRng>(
+        self,
+        _rng: &mut R,
+        strategy: &impl commonware_parallel::Strategy,
+    ) -> bool {
+        !self.items.is_empty()
+            && strategy.fold(
+                &self.items,
+                || true,
+                |valid, (payload, public_key, signature)| {
+                    valid && public_key.verify_inner(None, payload, signature)
+                },
+                |left, right| left && right,
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +271,50 @@ mod tests {
     use rstest::rstest;
 
     const NAMESPACE: &[u8] = b"test-namespace";
+
+    fn signed(seed: u64, message: &[u8]) -> (PublicKey, Signature) {
+        let signer = <PrivateKey as crate::Signer>::from_seed(seed);
+        (signer.public_key(), signer.sign(NAMESPACE, message))
+    }
+
+    #[test]
+    fn batch_verify_valid() {
+        let (first_key, first) = signed(1, b"first");
+        let (second_key, second) = signed(2, b"second");
+        let mut batch = <Batch as crate::BatchVerifier>::new(2);
+        assert!(crate::BatchVerifier::add(&mut batch, NAMESPACE, b"first", &first_key, &first));
+        assert!(crate::BatchVerifier::add(&mut batch, NAMESPACE, b"second", &second_key, &second));
+        assert!(crate::BatchVerifier::verify(
+            batch,
+            &mut commonware_utils::test_rng(),
+            &commonware_parallel::Sequential
+        ));
+    }
+
+    #[test]
+    fn batch_verify_invalid() {
+        let (first_key, first) = signed(1, b"first");
+        let (second_key, second) = signed(2, b"second");
+        let mut batch = <Batch as crate::BatchVerifier>::new(2);
+        crate::BatchVerifier::add(&mut batch, NAMESPACE, b"first", &first_key, &first);
+        // A valid signature over a different message.
+        crate::BatchVerifier::add(&mut batch, NAMESPACE, b"other", &second_key, &second);
+        assert!(!crate::BatchVerifier::verify(
+            batch,
+            &mut commonware_utils::test_rng(),
+            &commonware_parallel::Sequential
+        ));
+    }
+
+    #[test]
+    fn batch_verify_empty() {
+        let batch = <Batch as crate::BatchVerifier>::new(0);
+        assert!(!crate::BatchVerifier::verify(
+            batch,
+            &mut commonware_utils::test_rng(),
+            &commonware_parallel::Sequential
+        ));
+    }
 
     #[test]
     fn test_codec_private_key() {

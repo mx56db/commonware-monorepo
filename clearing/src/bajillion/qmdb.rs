@@ -11,7 +11,7 @@ use bytes::BufMut;
 use commonware_codec::{
     Buf, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt as _, Write,
 };
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::{Digest, Hasher, PublicKey, Sha256};
 use commonware_parallel::{Sequential, Strategy};
 use commonware_runtime::Spawner;
 use commonware_storage::{
@@ -34,7 +34,7 @@ use core::num::NonZeroU64;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Canonical bytes of a live account's public key.
+/// State key of a live account, derived by [`account_key`].
 pub type AccountKey = FixedBytes<32>;
 /// A live account's positive balance, encoded in eight bytes.
 pub type Balance = NonZeroU64;
@@ -615,9 +615,21 @@ impl<E: Context + Spawner, H: Hasher, S: Strategy> State<E, H, S> {
     }
 }
 
-/// Convert the canonical account encoding without hashing, padding, or truncation.
+/// Hash namespace deriving the state key of an account whose public key is not 32 bytes.
+pub const ACCOUNT_KEY_HASH_NAMESPACE: &[u8] = b"_COMMONWARE_CLEARING_ACCOUNT_KEY";
+
+/// Derive an account's state key from its canonical public-key encoding.
+///
+/// A 32-byte key is used as-is, without hashing, padding, or truncation. Any other width (for
+/// example a 33-byte compressed secp256r1 key) is keyed by
+/// `SHA-256(ACCOUNT_KEY_HASH_NAMESPACE || key)`. The width is fixed by `P`, so one deployment
+/// never mixes the two forms.
 pub fn account_key<P: PublicKey>(account: &P) -> Result<AccountKey, Error> {
-    let bytes: [u8; 32] = account.as_ref().try_into().map_err(|_| Error::AccountKey)?;
+    if let Ok(bytes) = <[u8; 32]>::try_from(account.as_ref()) {
+        return Ok(AccountKey::new(bytes));
+    }
+    let digest = Sha256::hash(&[ACCOUNT_KEY_HASH_NAMESPACE, account.as_ref()]);
+    let bytes: [u8; 32] = digest.as_ref().try_into().map_err(|_| Error::AccountKey)?;
     Ok(AccountKey::new(bytes))
 }
 
@@ -876,6 +888,22 @@ mod tests {
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&value.to_be_bytes());
         AccountKey::new(bytes)
+    }
+
+    #[test]
+    fn account_key_keeps_32_byte_keys_and_hashes_other_widths() {
+        let ed = ed25519::PrivateKey::from_seed(7).public_key();
+        assert_eq!(account_key(&ed).unwrap().as_ref(), ed.as_ref());
+
+        let p256 = commonware_cryptography::secp256r1::standard::PrivateKey::from_seed(7)
+            .public_key();
+        assert_eq!(p256.as_ref().len(), 33);
+        let expected = Sha256::hash(&[ACCOUNT_KEY_HASH_NAMESPACE, p256.as_ref()]);
+        assert_eq!(account_key(&p256).unwrap().as_ref(), expected.as_ref());
+
+        let other = commonware_cryptography::secp256r1::standard::PrivateKey::from_seed(8)
+            .public_key();
+        assert_ne!(account_key(&p256).unwrap(), account_key(&other).unwrap());
     }
 
     fn colliding_key(value: u64) -> AccountKey {

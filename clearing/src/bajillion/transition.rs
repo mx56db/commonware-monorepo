@@ -1211,7 +1211,7 @@ pub fn prepare_dealing<H: Hasher<Digest = D>, P: PublicKey, D: Digest>(
         return Err(TransitionError::NonCanonicalRows);
     }
 
-    // Activity and recipient indices share the Current account key ordering.
+    // Activity rows and recipient indices follow canonical public-key bytes.
     let mut accounts = BTreeMap::new();
     let mut total_entries = 0_u64;
     for terminal in &terminals {
@@ -1228,13 +1228,13 @@ pub fn prepare_dealing<H: Hasher<Digest = D>, P: PublicKey, D: Digest>(
         {
             return Err(TransitionError::OutgoingEndpoint);
         }
-        accounts.insert(account_key(body.payer())?, body.payer().clone());
+        accounts.insert(body.payer().as_ref().to_vec(), body.payer().clone());
         total_entries = total_entries
             .checked_add(terminal.vector.entries().len() as u64)
             .filter(|n| *n <= limits.max_total_entries())
             .ok_or(TransitionError::CloseLimit)?;
         for entry in terminal.vector.entries() {
-            accounts.insert(account_key(&entry.recipient)?, entry.recipient.clone());
+            accounts.insert(entry.recipient.as_ref().to_vec(), entry.recipient.clone());
         }
         if accounts.len() as u64 > limits.max_rows()
             || accounts.len() > commitment::MAX_VECTOR_LENGTH as usize
@@ -1253,7 +1253,7 @@ pub fn prepare_dealing<H: Hasher<Digest = D>, P: PublicKey, D: Digest>(
                 .map(|request| request.account()),
         )
     {
-        accounts.insert(account_key(account)?, account.clone());
+        accounts.insert(account.as_ref().to_vec(), account.clone());
     }
     if accounts.len() as u64 > limits.max_rows()
         || accounts.len() > commitment::MAX_VECTOR_LENGTH as usize
@@ -1529,6 +1529,9 @@ where
         outputs.clone(),
         context.floors(),
     );
+    // Rows follow canonical public-key bytes; the state requires state-key order, which differs
+    // when account keys are hashed (see `qmdb::account_key`).
+    updates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let state_preparation = state.prepare(state.head(), updates);
     let (prepared_logs, candidate) = logs::join(log_preparation, state_preparation).await;
     let prepared_logs = prepared_logs?;
